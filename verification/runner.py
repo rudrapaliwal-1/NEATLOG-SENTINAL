@@ -95,6 +95,18 @@ async def verify_patch(
     run_id = request.run_id or f"run_{uuid.uuid4().hex[:12]}"
     patch_id = request.patch_id or ""
 
+    # Keep caller-controlled resource limits bounded. Invalid limits are a policy
+    # failure and must not silently become an unbounded or zero-length run.
+    if (isinstance(request.timeout_seconds, bool)
+            or not isinstance(request.timeout_seconds, int)
+            or not 1 <= request.timeout_seconds <= 300):
+        return VerificationResult(
+            job_id=job_id, patch_hash=patch_hash,
+            status=VerificationStatus.POLICY_REJECTED.value,
+            execution_error="timeout_seconds must be an integer between 1 and 300.",
+            run_id=run_id, patch_id=patch_id,
+        )
+
     # 1. Target Application Authorization Check
     if request.target_app_id != "bola-demo-v1" and not (request.source_root and re.fullmatch(r"project-[0-9a-f]{32}", request.target_app_id)):
         return VerificationResult(
@@ -241,19 +253,23 @@ async def verify_patch(
             "--rm",
             "--network", "none",
             "--memory", "512m",
+            "--memory-swap", "512m",
             "--cpus", "1.0",
             "--pids-limit", "64",
+            "--ulimit", "nofile=256:256",
+            "--shm-size", "16m",
             "--cap-drop", "ALL",
             "--security-opt", "no-new-privileges",
+            "--user", "1001:1001",
             "--read-only",
-            "--tmpfs", "/tmp:rw,noexec,nosuid,size=64m",
+            "--tmpfs", "/tmp:rw,noexec,nosuid,nodev,size=64m",
             "-e", "VERIFICATION_REPORT_PATH=/workspace/report/test_report.json",
             "-e", "PYTHONPATH=/workspace",
             "-e", "PYTHONDONTWRITEBYTECODE=1",
             "-e", "PYTHONUNBUFFERED=1",
-            "-v", f"{app_dest}:/workspace/verification/lab/app:ro",
-            "-v", f"{tests_dest}:/workspace/verification/protected_tests:ro",
-            "-v", f"{report_dir}:/workspace/report:rw",
+            "-v", f"{app_dest}:/workspace/verification/lab/app:ro,nosuid,nodev",
+            "-v", f"{tests_dest}:/workspace/verification/protected_tests:ro,nosuid,nodev",
+            "-v", f"{report_dir}:/workspace/report:rw,nosuid,nodev",
             docker_image,
             "pytest", "-p", "no:cacheprovider", "/workspace/verification/protected_tests", "-v",
         ]
@@ -282,7 +298,16 @@ async def verify_patch(
             timed_out = True
             exit_code = -1
             raw_output = f"Execution timed out after {request.timeout_seconds}s."
-            subprocess.run(["docker", "kill", container_id], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            try:
+                subprocess.run(["docker", "kill", container_id], stdout=subprocess.DEVNULL,
+                               stderr=subprocess.DEVNULL, timeout=5.0, check=False)
+            except (OSError, subprocess.TimeoutExpired):
+                pass
+            if proc is not None:
+                try:
+                    await asyncio.wait_for(proc.wait(), timeout=5.0)
+                except (asyncio.TimeoutError, OSError):
+                    pass
         except Exception as exc:
             runner_error = str(exc)
             exit_code = 1
@@ -315,5 +340,9 @@ async def verify_patch(
 
     finally:
         # Guaranteed cleanup of container and ephemeral workspace
-        subprocess.run(["docker", "rm", "-f", container_id], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        try:
+            subprocess.run(["docker", "rm", "-f", container_id], stdout=subprocess.DEVNULL,
+                           stderr=subprocess.DEVNULL, timeout=5.0, check=False)
+        except (OSError, subprocess.TimeoutExpired):
+            pass
         shutil.rmtree(temp_dir, ignore_errors=True)

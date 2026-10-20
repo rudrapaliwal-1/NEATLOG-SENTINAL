@@ -115,6 +115,25 @@ class TestResultEvaluator:
                 patch_id=patch_id,
             )
 
+        # Reject malformed records before deriving any verdict. In particular, test
+        # names alone are not sufficient evidence: the node IDs must come from the
+        # protected suite and each required test must occur exactly once.
+        valid_outcomes = {"passed", "failed", "error", "skipped"}
+        if any(
+            not isinstance(test, dict)
+            or not isinstance(test.get("nodeid"), str)
+            or not test["nodeid"]
+            or test.get("outcome") not in valid_outcomes
+            for test in tests_data
+        ):
+            return cls._execution_error(job_id, patch_hash, run_id, patch_id, duration_ms,
+                                        "Invalid test record in verification report.")
+
+        nodeids = [test["nodeid"] for test in tests_data]
+        if len(nodeids) != len(set(nodeids)):
+            return cls._execution_error(job_id, patch_hash, run_id, patch_id, duration_ms,
+                                        "Evidence tampering detected: duplicate test records.")
+
         # Compute counts directly from individual test records for tamper resistance
         recorded_total = len(tests_data)
         recorded_passed = sum(1 for t in tests_data if isinstance(t, dict) and t.get("outcome") == "passed")
@@ -129,7 +148,9 @@ class TestResultEvaluator:
         errored = summary.get("error", recorded_errored)
 
         # Reconcile summary with test record counts
-        if total != recorded_total or passed != recorded_passed or failed != recorded_failed:
+        if (total != recorded_total or passed != recorded_passed or failed != recorded_failed
+                or errored != recorded_errored or summary.get("skipped", 0) != sum(
+                    1 for test in tests_data if test["outcome"] == "skipped")):
             return VerificationResult(
                 job_id=job_id,
                 patch_hash=patch_hash,
@@ -178,7 +199,12 @@ class TestResultEvaluator:
 
         # 5. Required Protected Test Suite Inventory Check (Anti-Evasion)
         missing_required = cls.REQUIRED_TEST_NAMES - executed_test_functions
-        if missing_required:
+        protected_prefixes = ("verification/protected_tests/", "protected_tests/")
+        required_records = [test for test in tests_data
+                            if test["nodeid"].startswith(protected_prefixes)]
+        if missing_required or len(required_records) != len(cls.REQUIRED_TEST_NAMES) or any(
+            test["nodeid"].split("::")[-1] not in cls.REQUIRED_TEST_NAMES for test in required_records
+        ):
             return VerificationResult(
                 job_id=job_id,
                 patch_hash=patch_hash,
@@ -272,4 +298,14 @@ class TestResultEvaluator:
             tests_collected=total,
             collection_complete=True,
             execution_completed=True,
+        )
+
+    @staticmethod
+    def _execution_error(job_id: str, patch_hash: str, run_id: Optional[str], patch_id: Optional[str],
+                         duration_ms: int, message: str) -> VerificationResult:
+        return VerificationResult(
+            job_id=job_id, patch_hash=patch_hash,
+            status=VerificationStatus.EXECUTION_ERROR.value,
+            duration_ms=duration_ms, execution_error=message,
+            run_id=run_id, patch_id=patch_id,
         )

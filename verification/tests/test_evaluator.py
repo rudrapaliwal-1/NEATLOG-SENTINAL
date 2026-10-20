@@ -180,3 +180,34 @@ def test_evaluator_returns_verified_when_all_pass():
     assert result.tests_passed == 8
     assert result.tests_failed == 0
     assert result.failed_tests == []
+
+
+def test_evaluator_rejects_duplicate_required_test_records():
+    records = [{"nodeid": node, "outcome": "passed"} for node in ALL_REQUIRED_TEST_NODES]
+    records[-1] = dict(records[-2])
+    report = json.dumps({"summary": {"total": 8, "passed": 8, "failed": 0,
+                                      "error": 0, "skipped": 0}, "tests": records})
+    result = TestResultEvaluator.evaluate("job", "hash", 0, "", report)
+    assert result.status == VerificationStatus.EXECUTION_ERROR.value
+    assert "duplicate" in result.execution_error
+
+
+def test_evaluator_rejects_test_names_outside_protected_suite():
+    report = json.dumps({
+        "summary": {"total": 8, "passed": 8, "failed": 0, "error": 0, "skipped": 0},
+        "tests": [{"nodeid": f"untrusted/test_file.py::{node.split('::')[-1]}",
+                   "outcome": "passed"} for node in ALL_REQUIRED_TEST_NODES],
+    })
+    result = TestResultEvaluator.evaluate("job", "hash", 0, "", report)
+    assert result.status == VerificationStatus.EXECUTION_ERROR.value
+    assert "not executed" in result.execution_error
+
+
+def test_evaluator_reconciles_error_and_skipped_summary_counts():
+    report = json.dumps({
+        "summary": {"total": 8, "passed": 8, "failed": 0, "error": 1, "skipped": 0},
+        "tests": [{"nodeid": node, "outcome": "passed"} for node in ALL_REQUIRED_TEST_NODES],
+    })
+    result = TestResultEvaluator.evaluate("job", "hash", 0, "", report)
+    assert result.status == VerificationStatus.EXECUTION_ERROR.value
+    assert "summary counts mismatch" in result.execution_error
